@@ -58,10 +58,16 @@ def transpose_to_landscape(head, activate=True):
     and stack everything back together.
     """
 
+    cache = {"ptr": None, "hw": None, "ref": None}
+
     def wrapper_no(decout, true_shape, **kwargs):
         B = len(true_shape)
-        assert true_shape[0:1].allclose(true_shape), "true_shape must be all identical"
-        H, W = true_shape[0].cpu().tolist()
+        ptr = true_shape.untyped_storage().data_ptr()
+        if cache["hw"] is None or ptr != cache["ptr"]:
+            assert true_shape[0:1].allclose(true_shape), "true_shape must be all identical"
+            cache["hw"] = tuple(int(v) for v in true_shape[0].cpu().tolist())
+            cache["ptr"], cache["ref"] = ptr, true_shape
+        H, W = cache["hw"]
         res = head(decout, (H, W), **kwargs)
         return res
 

@@ -1,3 +1,82 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>CUT3R · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>3.29x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-3.29x-2ea44f"></a>
+    <a href="https://github.com/CUT3R/CUT3R/commit/8bc15dc92a6d7fd92920b4ec81540d3dec7d3ecf"><img alt="base" src="https://img.shields.io/badge/upstream-8bc15dc92a6d-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [CUT3R/CUT3R](https://github.com/CUT3R/CUT3R) at commit
+> [`8bc15dc92a6d`](https://github.com/CUT3R/CUT3R/commit/8bc15dc92a6d7fd92920b4ec81540d3dec7d3ecf) with the AutoOptm patch applied on top.
+> Upstream's `demo.py` reconstructs one sequence per launch and then opens the interactive viewer,
+> which never returns; that command is unchanged here. This fork adds an opt-in `--seq_paths a b c`
+> that reconstructs several sequences in one process with the model loaded once and no viewer, and
+> that is how both the stock and the optimized program were measured.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept verbatim at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python demo.py --model_path src/cut3r_512_dpt_4_64.pth --seq_path examples/001 --size 512 --vis_threshold 1.5 --output_dir tmp` (upstream's documented example); measured as the same command with `--seq_paths` over `examples/001`-`004`, cycled 7 times (28 sequences, 714 frames) in one process |
+| **Entry point** | `demo.py` |
+| **Unit measured** | one image sequence: frame decode and resize → the recurrent CUT3R forward over all of its frames → per-frame post-processing → the depth, confidence, colour and camera files written for every frame |
+| **Before (stock)** | 2,044 ms per sequence (median; 115.98 s for the timed loop) |
+| **After (this tree, all switches default ON)** | 621 ms per sequence (median; 32.07 s for the timed loop) |
+| **Speedup** | **3.29x** end to end on RTX 4090 (median per sequence; the whole timed loop 3.62x), noise floor of the host 0.32% |
+| **Output** | reconstructed point clouds within relative L2 1.9e-4 of the stock program's (max absolute difference 0.0061, cosine 1.0); the written PNGs decode to the same pixels; verified on the pinned sequences and on a held-out set the optimiser never saw (relative L2 1.7e-4) |
+
+The tree also carries two compatibility fixes, in place for the stock and the optimized
+measurement alike: the checkpoint is loaded with `weights_only=False` (PyTorch 2.6 and later refuse
+it otherwise), and the pure-PyTorch `RoPE2D` used when CroCo's compiled RoPE extension is not built
+accepts the pose token's position of -1.
+
+### What changed
+
+| File | Where | Gain |
+|---|---|---|
+| `demo.py` | `prepare_output()` | 1.33x |
+| `src/dust3r/utils/image.py` | `load_images()` | 1.32x |
+| `src/dust3r/model.py` | `ARCroco3DStereo._forward_impl` | 1.25x |
+| `demo.py`, `src/dust3r/inference.py` | `prepare_output()` / `run_inference()` / `inference()` | 1.07x |
+| `demo.py` | `prepare_input()` | 1.045x |
+| `src/dust3r/heads/dpt_head.py` | `DPTPts3dPose.forward` / `__init__` | 1.045x |
+| `src/croco/models/pos_embed.py` | `RoPE2D` | 1.03x |
+| `demo.py` | `prepare_output()` | 1.02x |
+| `src/dust3r/heads/dpt_head.py` | `DPTPts3dPose` | 1.00x |
+| `src/dust3r/utils/misc.py` | `transpose_to_landscape` | 0.99x |
+| `demo.py` | `parse_args()` / `run_sequences()` (new): `--seq_paths`, `--no_viewer` | — (how the run is measured) |
+| `src/dust3r/model.py` | checkpoint load | — (compatibility) |
+
+Each gain is measured on top of the rows above it, not alone.
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/CUT3R-ao.git
+cd CUT3R-ao
+# set up exactly as upstream documents (the checkpoint in src/cut3r_512_dpt_4_64.pth), then:
+python demo.py --model_path src/cut3r_512_dpt_4_64.pth --seq_path examples/001 --size 512 --vis_threshold 1.5 --output_dir tmp
+# several sequences in one process, as measured:
+python demo.py --model_path src/cut3r_512_dpt_4_64.pth --seq_paths examples/001 examples/002 examples/003 examples/004 --size 512 --vis_threshold 1.5 --output_dir tmp
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 8bc15dc92a6d` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 # Continuous 3D Perception Model with Persistent State
 <div align="center">
   <img src="./assets/factory-ezgif.com-video-speed.gif"  alt="CUT3R" />
@@ -205,4 +284,3 @@ If you find our work useful, please cite:
   year={2025}
 }
 ```
-

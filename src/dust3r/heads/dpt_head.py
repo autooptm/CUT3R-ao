@@ -23,6 +23,13 @@ from dust3r.blocks import ConditionModulationBlock
 from torch.utils.checkpoint import checkpoint
 
 
+def _ao_checkpoint(function, *args, **kwargs):
+    if not torch.is_grad_enabled():
+        kwargs.pop("use_reentrant", None)
+        return function(*args, **kwargs)
+    return checkpoint(function, *args, **kwargs)
+
+
 class DPTOutputAdapter_fix(DPTOutputAdapter):
     """
     Adapt croco's DPTOutputAdapter implementation for dust3r:
@@ -147,6 +154,8 @@ class DPTPts3dPose(nn.Module):
         self.has_rgb = has_rgb
         self.has_pose = has_pose
 
+        self.skip_unread_outputs = False
+
         pts_channels = 3 + has_conf
         rgb_channels = has_rgb * 3
         feature_dim = 256
@@ -211,20 +220,23 @@ class DPTPts3dPose(nn.Module):
             self.pose_head = PoseDecoder(hidden_size=in_dim)
 
     def forward(self, x, img_info, **kwargs):
+        skip = self.skip_unread_outputs
         if self.has_pose:
             pose_token = x[-1][:, 0].clone()
             token = x[-1][:, 1:]
             with torch.cuda.amp.autocast(enabled=False):
                 pose = self.pose_head(pose_token)
 
-            token_cross = token.clone()
-            for blk in self.final_transform:
-                token_cross = blk(token_cross, pose_token, kwargs.get("pos"))
+            if not skip:
+                token_cross = token.clone()
+                for blk in self.final_transform:
+                    token_cross = blk(token_cross, pose_token, kwargs.get("pos"))
             x = x[:-1] + [token]
-            x_cross = x[:-1] + [token_cross]
+            if not skip:
+                x_cross = x[:-1] + [token_cross]
 
         with torch.cuda.amp.autocast(enabled=False):
-            self_out = checkpoint(
+            self_out = _ao_checkpoint(
                 self.dpt_self,
                 x,
                 image_size=(img_info[0], img_info[1]),
@@ -235,8 +247,8 @@ class DPTPts3dPose(nn.Module):
             final_output["pts3d_in_self_view"] = final_output.pop("pts3d")
             final_output["conf_self"] = final_output.pop("conf")
 
-            if self.has_rgb:
-                rgb_out = checkpoint(
+            if self.has_rgb and not skip:
+                rgb_out = _ao_checkpoint(
                     self.dpt_rgb,
                     x,
                     image_size=(img_info[0], img_info[1]),
@@ -248,13 +260,19 @@ class DPTPts3dPose(nn.Module):
             if self.has_pose:
                 pose = postprocess_pose(pose, self.pose_mode)
                 final_output["camera_pose"] = pose  # B,7
-                cross_out = checkpoint(
-                    self.dpt_cross,
-                    x_cross,
-                    image_size=(img_info[0], img_info[1]),
-                    use_reentrant=False,
-                )
-                tmp = postprocess(cross_out, self.depth_mode, self.conf_mode)
-                final_output["pts3d_in_other_view"] = tmp.pop("pts3d")
-                final_output["conf"] = tmp.pop("conf")
+                if skip:
+                    final_output["pts3d_in_other_view"] = final_output[
+                        "pts3d_in_self_view"
+                    ]
+                    final_output["conf"] = final_output["conf_self"]
+                else:
+                    cross_out = _ao_checkpoint(
+                        self.dpt_cross,
+                        x_cross,
+                        image_size=(img_info[0], img_info[1]),
+                        use_reentrant=False,
+                    )
+                    tmp = postprocess(cross_out, self.depth_mode, self.conf_mode)
+                    final_output["pts3d_in_other_view"] = tmp.pop("pts3d")
+                    final_output["conf"] = tmp.pop("conf")
         return final_output

@@ -177,3 +177,44 @@ except ImportError:
             x = self.apply_rope1d(x, positions[:, :, 1], cos, sin)
             tokens = torch.cat((y, x), dim=-1)
             return tokens
+
+if getattr(RoPE2D, "__module__", "") == __name__:
+
+    _AO_MIN_POS = -1
+
+    _AO_MAX_POS = 2048
+
+    def _ao_get_cos_sin(self, D, seq_len, device, dtype):
+        seq_len = _AO_MAX_POS
+        key = ("ao", D, seq_len, device, dtype)
+        if key not in self.cache:
+            inv_freq = 1.0 / (
+                self.base ** (torch.arange(0, D, 2).float().to(device) / D)
+            )
+            t = torch.arange(_AO_MIN_POS, seq_len, device=device, dtype=inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, inv_freq).to(dtype)
+            freqs = torch.cat((freqs, freqs), dim=-1)
+            self.cache[key] = (freqs.cos(), freqs.sin())
+        return self.cache[key]
+
+    def _ao_apply_rope1d(self, tokens, pos1d, cos, sin):
+        assert pos1d.ndim == 2
+        idx = pos1d - _AO_MIN_POS
+        cos = torch.nn.functional.embedding(idx, cos)[:, None, :, :]
+        sin = torch.nn.functional.embedding(idx, sin)[:, None, :, :]
+        return (tokens * cos) + (self.rotate_half(tokens) * sin)
+
+    def _ao_forward(self, tokens, positions):
+        assert tokens.size(3) % 2 == 0, "number of dimensions should be a multiple of two"
+        D = tokens.size(3) // 2
+        assert positions.ndim == 3 and positions.shape[-1] == 2
+        cos, sin = self._ao_get_cos_sin(
+            D, None, tokens.device, tokens.dtype)
+        y, x = tokens.chunk(2, dim=-1)
+        y = self._ao_apply_rope1d(y, positions[:, :, 0], cos, sin)
+        x = self._ao_apply_rope1d(x, positions[:, :, 1], cos, sin)
+        return torch.cat((y, x), dim=-1)
+
+    RoPE2D._ao_get_cos_sin = _ao_get_cos_sin
+    RoPE2D._ao_apply_rope1d = _ao_apply_rope1d
+    RoPE2D.forward = _ao_forward

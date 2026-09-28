@@ -72,7 +72,7 @@ def strip_module(state_dict):
 def load_model(model_path, device, verbose=True):
     if verbose:
         print("... loading model from", model_path)
-    ckpt = torch.load(model_path, map_location="cpu")
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
     args = ckpt["args"].model.replace(
         "ManyAR_PatchEmbed", "PatchEmbedDust3R"
     )  # ManyAR only for aspect ratio not consistent
@@ -220,6 +220,52 @@ class LocalMemory(nn.Module):
         for blk in self.read_blocks:
             x, _ = blk(x, mem, None, None)
         return x[..., -self.v_dim :]
+
+
+_AO_OPT_1 = os.environ.get("CUT3R_OPT_1", "1") != "0"
+
+
+class _AoStepOpt:
+
+    _IN = ("feat_i", "pos_i", "state_feat", "state_pos", "mem",
+           "init_state_feat", "init_mem", "img_mask", "update", "reset")
+
+    def __init__(self, model):
+        self.model = model
+        self.entries = {}
+
+    def _build_step(self, key, shape_i, values):
+        static = {n: (v.clone() if torch.is_tensor(v) else v)
+                  for n, v in zip(self._IN, values)}
+
+        def call():
+            return self.model._ao_step(shape_i, **static)
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                call()
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = call()
+        self.entries[key] = (g, static, out)
+        return self.entries[key]
+
+    def __call__(self, key, shape_i, values):
+        entry = self.entries.get(key) or self._build_step(key, shape_i, values)
+        g, static, (out_res, out_state, out_mem) = entry
+        for n, v in zip(self._IN, values):
+            if torch.is_tensor(v):
+                static[n].copy_(v)
+        g.replay()
+        res, seen = {}, {}
+        for k, v in out_res.items():
+            res[k] = seen.setdefault(id(v), v.clone())
+        return res, out_state.clone(), out_mem.clone()
 
 
 class ARCroco3DStereo(CroCoNet):
@@ -813,6 +859,47 @@ class ARCroco3DStereo(CroCoNet):
             mem = init_mem * reset_mask + mem * (1 - reset_mask)
         return res, (state_feat, mem)
 
+    def _ao_step(self, shape_i, feat_i, pos_i, state_feat, state_pos, mem,
+                 init_state_feat, init_mem, img_mask, update, reset):
+        global_img_feat_i = self._get_img_level_feat(feat_i)
+        pose_feat_i = self.pose_retriever.inquire(global_img_feat_i, mem)
+        pose_pos_i = -torch.ones(
+            feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
+        )
+        new_state_feat, dec = self._recurrent_rollout(
+            state_feat,
+            state_pos,
+            feat_i,
+            pos_i,
+            pose_feat_i,
+            pose_pos_i,
+            init_state_feat,
+            img_mask=img_mask,
+            reset_mask=reset,
+            update=update,
+        )
+        new_mem = self.pose_retriever.update_mem(
+            mem, global_img_feat_i, dec[-1][:, 0:1]
+        )
+        assert len(dec) == self.dec_depth + 1
+        head_input = [
+            dec[0].float(),
+            dec[self.dec_depth * 2 // 4][:, 1:].float(),
+            dec[self.dec_depth * 3 // 4][:, 1:].float(),
+            dec[self.dec_depth].float(),
+        ]
+        res = self._downstream_head(head_input, shape_i, pos=pos_i)
+
+        update_mask = (img_mask & update) if update is not None else img_mask
+        update_mask = update_mask[:, None, None].float()
+        out_state = new_state_feat * update_mask + state_feat * (1 - update_mask)
+        out_mem = new_mem * update_mask + mem * (1 - update_mask)
+        if reset is not None:
+            reset_mask = reset[:, None, None].float()
+            out_state = init_state_feat * reset_mask + out_state * (1 - reset_mask)
+            out_mem = init_mem * reset_mask + out_mem * (1 - reset_mask)
+        return res, out_state, out_mem
+
     def _forward_impl(self, views, ret_state=False):
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
@@ -822,68 +909,86 @@ class ARCroco3DStereo(CroCoNet):
         init_mem = mem.clone()
         all_state_args = [(state_feat, state_pos, init_state_feat, mem, init_mem)]
         ress = []
+
+        stepper = None
+        if _AO_OPT_1 and self.pose_head_flag and feat[0].is_cuda and len(views) > 1:
+            if getattr(self, "_ao_steps", None) is None:
+                self._ao_steps = _AoStepOpt(self)
+            stepper = self._ao_steps
+            step_key = (
+                tuple(feat[0].shape),
+                tuple(pos[0].shape),
+                tuple(int(v) for v in shape[0][0].cpu().tolist()),
+            )
+
         for i in range(len(views)):
-            feat_i = feat[i]
-            pos_i = pos[i]
-            if self.pose_head_flag:
-                global_img_feat_i = self._get_img_level_feat(feat_i)
-                if i == 0:
-                    pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
-                else:
-                    pose_feat_i = self.pose_retriever.inquire(global_img_feat_i, mem)
-                pose_pos_i = -torch.ones(
-                    feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
-                )
-            else:
-                pose_feat_i = None
-                pose_pos_i = None
-            new_state_feat, dec = self._recurrent_rollout(
-                state_feat,
-                state_pos,
-                feat_i,
-                pos_i,
-                pose_feat_i,
-                pose_pos_i,
-                init_state_feat,
-                img_mask=views[i]["img_mask"],
-                reset_mask=views[i]["reset"],
-                update=views[i].get("update", None),
-            )
-            out_pose_feat_i = dec[-1][:, 0:1]
-            new_mem = self.pose_retriever.update_mem(
-                mem, global_img_feat_i, out_pose_feat_i
-            )
-            assert len(dec) == self.dec_depth + 1
-            head_input = [
-                dec[0].float(),
-                dec[self.dec_depth * 2 // 4][:, 1:].float(),
-                dec[self.dec_depth * 3 // 4][:, 1:].float(),
-                dec[self.dec_depth].float(),
-            ]
-            res = self._downstream_head(head_input, shape[i], pos=pos_i)
-            ress.append(res)
             img_mask = views[i]["img_mask"]
             update = views[i].get("update", None)
-            if update is not None:
-                update_mask = (
-                    img_mask & update
-                )  # if don't update, then whatever img_mask
-            else:
-                update_mask = img_mask
-            update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (
-                1 - update_mask
-            )  # update global state
-            mem = new_mem * update_mask + mem * (
-                1 - update_mask
-            )  # then update local state
-            reset_mask = views[i]["reset"]
-            if reset_mask is not None:
-                reset_mask = reset_mask[:, None, None].float()
-                state_feat = init_state_feat * reset_mask + state_feat * (
-                    1 - reset_mask
+            reset = views[i]["reset"]
+            if stepper is not None and i > 0:
+                res, state_feat, mem = stepper(
+                    step_key,
+                    shape[i],
+                    (feat[i], pos[i], state_feat, state_pos, mem,
+                     init_state_feat, init_mem, img_mask, update, reset),
                 )
-                mem = init_mem * reset_mask + mem * (1 - reset_mask)
+            else:
+                feat_i = feat[i]
+                pos_i = pos[i]
+                if self.pose_head_flag:
+                    global_img_feat_i = self._get_img_level_feat(feat_i)
+                    if i == 0:
+                        pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
+                    else:
+                        pose_feat_i = self.pose_retriever.inquire(
+                            global_img_feat_i, mem
+                        )
+                    pose_pos_i = -torch.ones(
+                        feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
+                    )
+                else:
+                    pose_feat_i = None
+                    pose_pos_i = None
+                new_state_feat, dec = self._recurrent_rollout(
+                    state_feat,
+                    state_pos,
+                    feat_i,
+                    pos_i,
+                    pose_feat_i,
+                    pose_pos_i,
+                    init_state_feat,
+                    img_mask=img_mask,
+                    reset_mask=reset,
+                    update=update,
+                )
+                out_pose_feat_i = dec[-1][:, 0:1]
+                new_mem = self.pose_retriever.update_mem(
+                    mem, global_img_feat_i, out_pose_feat_i
+                )
+                assert len(dec) == self.dec_depth + 1
+                head_input = [
+                    dec[0].float(),
+                    dec[self.dec_depth * 2 // 4][:, 1:].float(),
+                    dec[self.dec_depth * 3 // 4][:, 1:].float(),
+                    dec[self.dec_depth].float(),
+                ]
+                res = self._downstream_head(head_input, shape[i], pos=pos_i)
+                if update is not None:
+                    update_mask = img_mask & update
+                else:
+                    update_mask = img_mask
+                update_mask = update_mask[:, None, None].float()
+                state_feat = new_state_feat * update_mask + state_feat * (
+                    1 - update_mask
+                )  # update global state
+                mem = new_mem * update_mask + mem * (1 - update_mask)
+                if reset is not None:
+                    reset_mask = reset[:, None, None].float()
+                    state_feat = init_state_feat * reset_mask + state_feat * (
+                        1 - reset_mask
+                    )
+                    mem = init_mem * reset_mask + mem * (1 - reset_mask)
+            ress.append(res)
             all_state_args.append(
                 (state_feat, state_pos, init_state_feat, mem, init_mem)
             )

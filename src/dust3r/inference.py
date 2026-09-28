@@ -217,7 +217,7 @@ def loss_of_one_batch_tbptt(
 
 
 @torch.no_grad()
-def inference(groups, model, device, verbose=True):
+def inference(groups, model, device, verbose=True, to_host=True):
     ignore_keys = set(
         ["depthmap", "dataset", "label", "instance", "idx", "true_shape", "rng"]
     )
@@ -234,7 +234,7 @@ def inference(groups, model, device, verbose=True):
         print(f">> Inference with model on {len(groups)} image/raymaps")
 
     res, state_args = loss_of_one_batch(groups, model, None, None, inference=True)
-    result = to_cpu(res)
+    result = to_cpu(res) if to_host else res
     return result, state_args
 
 

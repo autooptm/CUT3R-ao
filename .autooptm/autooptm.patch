@@ -1,0 +1,763 @@
+diff --git a/demo.py b/demo.py
+index df60dbd62ec06dd3e8789661070b92333edf5e28..fbc573ad5a45b2068be5ed9cb56366e2cc5f629e 100644
+--- a/demo.py
++++ b/demo.py
+@@ -29,6 +29,11 @@ import shutil
+ from copy import deepcopy
+ from add_ckpt_path import add_path_to_dust3r
+ import imageio.v2 as iio
++from concurrent.futures import ThreadPoolExecutor
++
++_AO_OPT_2 = os.environ.get("CUT3R_OPT_2", "1") != "0"
++_AO_OPT_3 = int(os.environ.get("CUT3R_OPT_3", "24"))
++_AO_PNG_LEVEL = int(os.environ.get("CUT3R_PNG_LEVEL", "1"))
+ 
+ # Set random seed for reproducibility.
+ random.seed(42)
+@@ -76,6 +81,21 @@ def parse_args():
+         help="value for tempfile.tempdir",
+     )
+ 
++    parser.add_argument(
++        "--seq_paths",
++        type=str,
++        nargs="+",
++        default=None,
++        help="Optional: process SEVERAL sequences in one process, reusing the one "
++             "loaded model, writing each into <output_dir>/<sequence name>. The "
++             "single --seq_path invocation is unchanged.",
++    )
++    parser.add_argument(
++        "--no_viewer",
++        action="store_true",
++        help="Optional: skip the interactive viser viewer (implied by --seq_paths).",
++    )
++
+     return parser.parse_args()
+ 
+ 
+@@ -109,12 +129,7 @@ def prepare_input(
+             view = {
+                 "img": images[i]["img"],
+                 "ray_map": torch.full(
+-                    (
+-                        images[i]["img"].shape[0],
+-                        6,
+-                        images[i]["img"].shape[-2],
+-                        images[i]["img"].shape[-1],
+-                    ),
++                    (images[i]["img"].shape[0], 6, 1, 1),
+                     torch.nan,
+                 ),
+                 "true_shape": torch.from_numpy(images[i]["true_shape"]),
+@@ -207,15 +222,18 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
+     outputs["pred"] = outputs["pred"][-valid_length:]
+     outputs["views"] = outputs["views"][-valid_length:]
+ 
+-    pts3ds_self_ls = [output["pts3d_in_self_view"].cpu() for output in outputs["pred"]]
+-    pts3ds_other = [output["pts3d_in_other_view"].cpu() for output in outputs["pred"]]
+-    conf_self = [output["conf_self"].cpu() for output in outputs["pred"]]
+-    conf_other = [output["conf"].cpu() for output in outputs["pred"]]
++    def _host(t):
++        return t if _AO_OPT_2 else t.cpu()
++
++    pts3ds_self_ls = [_host(output["pts3d_in_self_view"]) for output in outputs["pred"]]
++    pts3ds_other = [_host(output["pts3d_in_other_view"]) for output in outputs["pred"]]
++    conf_self = [_host(output["conf_self"]) for output in outputs["pred"]]
++    conf_other = [_host(output["conf"]) for output in outputs["pred"]]
+     pts3ds_self = torch.cat(pts3ds_self_ls, 0)
+ 
+     # Recover camera poses.
+     pr_poses = [
+-        pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
++        _host(pose_encoding_to_camera(pred["camera_pose"].clone()))
+         for pred in outputs["pred"]
+     ]
+     R_c2w = torch.cat([pr_pose[:, :3, :3] for pr_pose in pr_poses], 0)
+@@ -234,7 +252,8 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
+     focal = estimate_focal_knowing_depth(pts3ds_self, pp, focal_mode="weiszfeld")
+ 
+     colors = [
+-        0.5 * (output["img"].permute(0, 2, 3, 1) + 1.0) for output in outputs["views"]
++        0.5 * (_host(output["img"]).permute(0, 2, 3, 1) + 1.0)
++        for output in outputs["views"]
+     ]
+ 
+     cam_dict = {
+@@ -251,16 +270,18 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
+     conf_other_tosave = torch.cat(conf_other)  # B, H, W
+     colors_tosave = torch.cat(
+         [
+-            0.5 * (output["img"].permute(0, 2, 3, 1).cpu() + 1.0)
++            0.5 * (_host(output["img"]).permute(0, 2, 3, 1) + 1.0)
+             for output in outputs["views"]
+         ]
+     )  # [B, H, W, 3]
+     cam2world_tosave = torch.cat(pr_poses)  # B, 4, 4
+     intrinsics_tosave = (
+-        torch.eye(3).unsqueeze(0).repeat(cam2world_tosave.shape[0], 1, 1)
++        torch.eye(3, device=cam2world_tosave.device)
++        .unsqueeze(0)
++        .repeat(cam2world_tosave.shape[0], 1, 1)
+     )  # B, 3, 3
+-    intrinsics_tosave[:, 0, 0] = focal.detach().cpu()
+-    intrinsics_tosave[:, 1, 1] = focal.detach().cpu()
++    intrinsics_tosave[:, 0, 0] = focal.detach().to(intrinsics_tosave.device)
++    intrinsics_tosave[:, 1, 1] = focal.detach().to(intrinsics_tosave.device)
+     intrinsics_tosave[:, 0, 2] = pp[:, 0]
+     intrinsics_tosave[:, 1, 2] = pp[:, 1]
+ 
+@@ -268,24 +289,34 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
+     os.makedirs(os.path.join(outdir, "conf"), exist_ok=True)
+     os.makedirs(os.path.join(outdir, "color"), exist_ok=True)
+     os.makedirs(os.path.join(outdir, "camera"), exist_ok=True)
+-    for f_id in range(len(pts3ds_self)):
+-        depth = depths_tosave[f_id].cpu().numpy()
+-        conf = conf_self_tosave[f_id].cpu().numpy()
+-        color = colors_tosave[f_id].cpu().numpy()
+-        c2w = cam2world_tosave[f_id].cpu().numpy()
+-        intrins = intrinsics_tosave[f_id].cpu().numpy()
+-        np.save(os.path.join(outdir, "depth", f"{f_id:06d}.npy"), depth)
+-        np.save(os.path.join(outdir, "conf", f"{f_id:06d}.npy"), conf)
++    depths_np = depths_tosave.cpu().numpy()
++    conf_np = conf_self_tosave.cpu().numpy()
++    colors_np = (colors_tosave * 255).to(torch.uint8).cpu().numpy()
++    c2w_np = cam2world_tosave.cpu().numpy()
++    intrins_np = intrinsics_tosave.cpu().numpy()
++
++    def _write_frame(f_id):
++        np.save(os.path.join(outdir, "depth", f"{f_id:06d}.npy"), depths_np[f_id])
++        np.save(os.path.join(outdir, "conf", f"{f_id:06d}.npy"), conf_np[f_id])
+         iio.imwrite(
+             os.path.join(outdir, "color", f"{f_id:06d}.png"),
+-            (color * 255).astype(np.uint8),
++            colors_np[f_id],
++            compress_level=_AO_PNG_LEVEL,
+         )
+         np.savez(
+             os.path.join(outdir, "camera", f"{f_id:06d}.npz"),
+-            pose=c2w,
+-            intrinsics=intrins,
++            pose=c2w_np[f_id],
++            intrinsics=intrins_np[f_id],
+         )
+ 
++    n_frames = len(pts3ds_self)
++    if _AO_OPT_3 > 1:
++        with ThreadPoolExecutor(max_workers=_AO_OPT_3) as pool:
++            list(pool.map(_write_frame, range(n_frames)))
++    else:
++        for f_id in range(n_frames):
++            _write_frame(f_id)
++
+     return pts3ds_other, colors, conf_other, cam_dict
+ 
+ 
+@@ -321,7 +352,7 @@ def parse_seq_path(p):
+     return img_paths, tmpdirname
+ 
+ 
+-def run_inference(args):
++def run_inference(args, model=None):
+     """
+     Execute the full inference and visualization pipeline.
+ 
+@@ -363,15 +394,21 @@ def run_inference(args):
+     if tmpdirname is not None:
+         shutil.rmtree(tmpdirname)
+ 
+-    # Load and prepare the model.
+-    print(f"Loading model from {args.model_path}...")
+-    model = ARCroco3DStereo.from_pretrained(args.model_path).to(device)
+-    model.eval()
++    if model is None:
++        print(f"Loading model from {args.model_path}...")
++        model = ARCroco3DStereo.from_pretrained(args.model_path).to(device)
++        model.eval()
+ 
+     # Run inference.
+     print("Running inference...")
++    _ao_head = getattr(model, "downstream_head", None)
++    _ao_skip_was = getattr(_ao_head, "skip_unread_outputs", None)
++    if _ao_skip_was is not None:
++        _ao_head.skip_unread_outputs = True
+     start_time = time.time()
+-    outputs, state_args = inference(views, model, device)
++    outputs, state_args = inference(
++        views, model, device, to_host=not _AO_OPT_2
++    )
+     total_time = time.time() - start_time
+     per_frame_time = total_time / len(views)
+     print(
+@@ -384,11 +421,18 @@ def run_inference(args):
+         outputs, args.output_dir, 1, True
+     )
+ 
++    if _ao_skip_was is not None:
++        _ao_head.skip_unread_outputs = _ao_skip_was
++
+     # Convert tensors to numpy arrays for visualization.
+     pts3ds_to_vis = [p.cpu().numpy() for p in pts3ds_other]
+     colors_to_vis = [c.cpu().numpy() for c in colors]
++    conf = [c.cpu() for c in conf]
+     edge_colors = [None] * len(pts3ds_to_vis)
+ 
++    if getattr(args, "no_viewer", False):
++        return
++
+     # Create and run the point cloud viewer.
+     print("Launching point cloud viewer...")
+     viewer = PointCloudViewer(
+@@ -407,8 +451,35 @@ def run_inference(args):
+     viewer.run()
+ 
+ 
++def run_sequences(args):
++    device = args.device
++    if device == "cuda" and not torch.cuda.is_available():
++        print("CUDA not available. Switching to CPU.")
++        device = "cpu"
++
++    add_path_to_dust3r(args.model_path)
++    from src.dust3r.model import ARCroco3DStereo
++
++    print(f"Loading model from {args.model_path}...")
++    model = ARCroco3DStereo.from_pretrained(args.model_path).to(device)
++    model.eval()
++
++    base_output_dir = args.output_dir
++    for _ao_seq_path in args.seq_paths:
++        seq_args = deepcopy(args)
++        seq_args.device = device
++        seq_args.seq_path = _ao_seq_path
++        seq_args.no_viewer = True
++        seq_args.output_dir = os.path.join(
++            base_output_dir, os.path.basename(_ao_seq_path.rstrip("/")) or "seq")
++        run_inference(seq_args, model=model)
++
++
+ def main():
+     args = parse_args()
++    if args.seq_paths:
++        run_sequences(args)
++        return
+     if not args.seq_path:
+         print(
+             "No inputs found! Please use our gradio demo if you would like to iteractively upload inputs."
+diff --git a/src/croco/models/pos_embed.py b/src/croco/models/pos_embed.py
+index 0f76e4d5be2222d446f14d7fb24a047b686cb328..a67eae53986b3a7d8110f63c41a133258f4babbf 100644
+--- a/src/croco/models/pos_embed.py
++++ b/src/croco/models/pos_embed.py
+@@ -177,3 +177,44 @@ except ImportError:
+             x = self.apply_rope1d(x, positions[:, :, 1], cos, sin)
+             tokens = torch.cat((y, x), dim=-1)
+             return tokens
++
++if getattr(RoPE2D, "__module__", "") == __name__:
++
++    _AO_MIN_POS = -1
++
++    _AO_MAX_POS = 2048
++
++    def _ao_get_cos_sin(self, D, seq_len, device, dtype):
++        seq_len = _AO_MAX_POS
++        key = ("ao", D, seq_len, device, dtype)
++        if key not in self.cache:
++            inv_freq = 1.0 / (
++                self.base ** (torch.arange(0, D, 2).float().to(device) / D)
++            )
++            t = torch.arange(_AO_MIN_POS, seq_len, device=device, dtype=inv_freq.dtype)
++            freqs = torch.einsum("i,j->ij", t, inv_freq).to(dtype)
++            freqs = torch.cat((freqs, freqs), dim=-1)
++            self.cache[key] = (freqs.cos(), freqs.sin())
++        return self.cache[key]
++
++    def _ao_apply_rope1d(self, tokens, pos1d, cos, sin):
++        assert pos1d.ndim == 2
++        idx = pos1d - _AO_MIN_POS
++        cos = torch.nn.functional.embedding(idx, cos)[:, None, :, :]
++        sin = torch.nn.functional.embedding(idx, sin)[:, None, :, :]
++        return (tokens * cos) + (self.rotate_half(tokens) * sin)
++
++    def _ao_forward(self, tokens, positions):
++        assert tokens.size(3) % 2 == 0, "number of dimensions should be a multiple of two"
++        D = tokens.size(3) // 2
++        assert positions.ndim == 3 and positions.shape[-1] == 2
++        cos, sin = self._ao_get_cos_sin(
++            D, None, tokens.device, tokens.dtype)
++        y, x = tokens.chunk(2, dim=-1)
++        y = self._ao_apply_rope1d(y, positions[:, :, 0], cos, sin)
++        x = self._ao_apply_rope1d(x, positions[:, :, 1], cos, sin)
++        return torch.cat((y, x), dim=-1)
++
++    RoPE2D._ao_get_cos_sin = _ao_get_cos_sin
++    RoPE2D._ao_apply_rope1d = _ao_apply_rope1d
++    RoPE2D.forward = _ao_forward
+diff --git a/src/dust3r/heads/dpt_head.py b/src/dust3r/heads/dpt_head.py
+index 11bd08ed69679c09770a728d98afb6a1b1bc1cf3..93a547c720fb2553a585134b7145fbb459f28e87 100755
+--- a/src/dust3r/heads/dpt_head.py
++++ b/src/dust3r/heads/dpt_head.py
+@@ -23,6 +23,13 @@ from dust3r.blocks import ConditionModulationBlock
+ from torch.utils.checkpoint import checkpoint
+ 
+ 
++def _ao_checkpoint(function, *args, **kwargs):
++    if not torch.is_grad_enabled():
++        kwargs.pop("use_reentrant", None)
++        return function(*args, **kwargs)
++    return checkpoint(function, *args, **kwargs)
++
++
+ class DPTOutputAdapter_fix(DPTOutputAdapter):
+     """
+     Adapt croco's DPTOutputAdapter implementation for dust3r:
+@@ -147,6 +154,8 @@ class DPTPts3dPose(nn.Module):
+         self.has_rgb = has_rgb
+         self.has_pose = has_pose
+ 
++        self.skip_unread_outputs = False
++
+         pts_channels = 3 + has_conf
+         rgb_channels = has_rgb * 3
+         feature_dim = 256
+@@ -211,20 +220,23 @@ class DPTPts3dPose(nn.Module):
+             self.pose_head = PoseDecoder(hidden_size=in_dim)
+ 
+     def forward(self, x, img_info, **kwargs):
++        skip = self.skip_unread_outputs
+         if self.has_pose:
+             pose_token = x[-1][:, 0].clone()
+             token = x[-1][:, 1:]
+             with torch.cuda.amp.autocast(enabled=False):
+                 pose = self.pose_head(pose_token)
+ 
+-            token_cross = token.clone()
+-            for blk in self.final_transform:
+-                token_cross = blk(token_cross, pose_token, kwargs.get("pos"))
++            if not skip:
++                token_cross = token.clone()
++                for blk in self.final_transform:
++                    token_cross = blk(token_cross, pose_token, kwargs.get("pos"))
+             x = x[:-1] + [token]
+-            x_cross = x[:-1] + [token_cross]
++            if not skip:
++                x_cross = x[:-1] + [token_cross]
+ 
+         with torch.cuda.amp.autocast(enabled=False):
+-            self_out = checkpoint(
++            self_out = _ao_checkpoint(
+                 self.dpt_self,
+                 x,
+                 image_size=(img_info[0], img_info[1]),
+@@ -235,8 +247,8 @@ class DPTPts3dPose(nn.Module):
+             final_output["pts3d_in_self_view"] = final_output.pop("pts3d")
+             final_output["conf_self"] = final_output.pop("conf")
+ 
+-            if self.has_rgb:
+-                rgb_out = checkpoint(
++            if self.has_rgb and not skip:
++                rgb_out = _ao_checkpoint(
+                     self.dpt_rgb,
+                     x,
+                     image_size=(img_info[0], img_info[1]),
+@@ -248,13 +260,19 @@ class DPTPts3dPose(nn.Module):
+             if self.has_pose:
+                 pose = postprocess_pose(pose, self.pose_mode)
+                 final_output["camera_pose"] = pose  # B,7
+-                cross_out = checkpoint(
+-                    self.dpt_cross,
+-                    x_cross,
+-                    image_size=(img_info[0], img_info[1]),
+-                    use_reentrant=False,
+-                )
+-                tmp = postprocess(cross_out, self.depth_mode, self.conf_mode)
+-                final_output["pts3d_in_other_view"] = tmp.pop("pts3d")
+-                final_output["conf"] = tmp.pop("conf")
++                if skip:
++                    final_output["pts3d_in_other_view"] = final_output[
++                        "pts3d_in_self_view"
++                    ]
++                    final_output["conf"] = final_output["conf_self"]
++                else:
++                    cross_out = _ao_checkpoint(
++                        self.dpt_cross,
++                        x_cross,
++                        image_size=(img_info[0], img_info[1]),
++                        use_reentrant=False,
++                    )
++                    tmp = postprocess(cross_out, self.depth_mode, self.conf_mode)
++                    final_output["pts3d_in_other_view"] = tmp.pop("pts3d")
++                    final_output["conf"] = tmp.pop("conf")
+         return final_output
+diff --git a/src/dust3r/inference.py b/src/dust3r/inference.py
+index 9d7a1870152f682a4f708fe33fe301174d926134..a9ee1a2f4d7be8399720f848ddb0a36d2c736283 100755
+--- a/src/dust3r/inference.py
++++ b/src/dust3r/inference.py
+@@ -217,7 +217,7 @@ def loss_of_one_batch_tbptt(
+ 
+ 
+ @torch.no_grad()
+-def inference(groups, model, device, verbose=True):
++def inference(groups, model, device, verbose=True, to_host=True):
+     ignore_keys = set(
+         ["depthmap", "dataset", "label", "instance", "idx", "true_shape", "rng"]
+     )
+@@ -234,7 +234,7 @@ def inference(groups, model, device, verbose=True):
+         print(f">> Inference with model on {len(groups)} image/raymaps")
+ 
+     res, state_args = loss_of_one_batch(groups, model, None, None, inference=True)
+-    result = to_cpu(res)
++    result = to_cpu(res) if to_host else res
+     return result, state_args
+ 
+ 
+diff --git a/src/dust3r/model.py b/src/dust3r/model.py
+index 7ed9f6106fb063686990c874ede99876ebc939ab..da17a66495223194cec4832205908ff7b1387b18 100644
+--- a/src/dust3r/model.py
++++ b/src/dust3r/model.py
+@@ -72,7 +72,7 @@ def strip_module(state_dict):
+ def load_model(model_path, device, verbose=True):
+     if verbose:
+         print("... loading model from", model_path)
+-    ckpt = torch.load(model_path, map_location="cpu")
++    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+     args = ckpt["args"].model.replace(
+         "ManyAR_PatchEmbed", "PatchEmbedDust3R"
+     )  # ManyAR only for aspect ratio not consistent
+@@ -222,6 +222,52 @@ class LocalMemory(nn.Module):
+         return x[..., -self.v_dim :]
+ 
+ 
++_AO_OPT_1 = os.environ.get("CUT3R_OPT_1", "1") != "0"
++
++
++class _AoStepOpt:
++
++    _IN = ("feat_i", "pos_i", "state_feat", "state_pos", "mem",
++           "init_state_feat", "init_mem", "img_mask", "update", "reset")
++
++    def __init__(self, model):
++        self.model = model
++        self.entries = {}
++
++    def _build_step(self, key, shape_i, values):
++        static = {n: (v.clone() if torch.is_tensor(v) else v)
++                  for n, v in zip(self._IN, values)}
++
++        def call():
++            return self.model._ao_step(shape_i, **static)
++
++        side = torch.cuda.Stream()
++        side.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(side):
++            for _ in range(3):
++                call()
++        torch.cuda.current_stream().wait_stream(side)
++        torch.cuda.synchronize()
++
++        g = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(g):
++            out = call()
++        self.entries[key] = (g, static, out)
++        return self.entries[key]
++
++    def __call__(self, key, shape_i, values):
++        entry = self.entries.get(key) or self._build_step(key, shape_i, values)
++        g, static, (out_res, out_state, out_mem) = entry
++        for n, v in zip(self._IN, values):
++            if torch.is_tensor(v):
++                static[n].copy_(v)
++        g.replay()
++        res, seen = {}, {}
++        for k, v in out_res.items():
++            res[k] = seen.setdefault(id(v), v.clone())
++        return res, out_state.clone(), out_mem.clone()
++
++
+ class ARCroco3DStereo(CroCoNet):
+     config_class = ARCroco3DStereoConfig
+     base_model_prefix = "arcroco3dstereo"
+@@ -813,6 +859,47 @@ class ARCroco3DStereo(CroCoNet):
+             mem = init_mem * reset_mask + mem * (1 - reset_mask)
+         return res, (state_feat, mem)
+ 
++    def _ao_step(self, shape_i, feat_i, pos_i, state_feat, state_pos, mem,
++                 init_state_feat, init_mem, img_mask, update, reset):
++        global_img_feat_i = self._get_img_level_feat(feat_i)
++        pose_feat_i = self.pose_retriever.inquire(global_img_feat_i, mem)
++        pose_pos_i = -torch.ones(
++            feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
++        )
++        new_state_feat, dec = self._recurrent_rollout(
++            state_feat,
++            state_pos,
++            feat_i,
++            pos_i,
++            pose_feat_i,
++            pose_pos_i,
++            init_state_feat,
++            img_mask=img_mask,
++            reset_mask=reset,
++            update=update,
++        )
++        new_mem = self.pose_retriever.update_mem(
++            mem, global_img_feat_i, dec[-1][:, 0:1]
++        )
++        assert len(dec) == self.dec_depth + 1
++        head_input = [
++            dec[0].float(),
++            dec[self.dec_depth * 2 // 4][:, 1:].float(),
++            dec[self.dec_depth * 3 // 4][:, 1:].float(),
++            dec[self.dec_depth].float(),
++        ]
++        res = self._downstream_head(head_input, shape_i, pos=pos_i)
++
++        update_mask = (img_mask & update) if update is not None else img_mask
++        update_mask = update_mask[:, None, None].float()
++        out_state = new_state_feat * update_mask + state_feat * (1 - update_mask)
++        out_mem = new_mem * update_mask + mem * (1 - update_mask)
++        if reset is not None:
++            reset_mask = reset[:, None, None].float()
++            out_state = init_state_feat * reset_mask + out_state * (1 - reset_mask)
++            out_mem = init_mem * reset_mask + out_mem * (1 - reset_mask)
++        return res, out_state, out_mem
++
+     def _forward_impl(self, views, ret_state=False):
+         shape, feat_ls, pos = self._encode_views(views)
+         feat = feat_ls[-1]
+@@ -822,68 +909,86 @@ class ARCroco3DStereo(CroCoNet):
+         init_mem = mem.clone()
+         all_state_args = [(state_feat, state_pos, init_state_feat, mem, init_mem)]
+         ress = []
+-        for i in range(len(views)):
+-            feat_i = feat[i]
+-            pos_i = pos[i]
+-            if self.pose_head_flag:
+-                global_img_feat_i = self._get_img_level_feat(feat_i)
+-                if i == 0:
+-                    pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
+-                else:
+-                    pose_feat_i = self.pose_retriever.inquire(global_img_feat_i, mem)
+-                pose_pos_i = -torch.ones(
+-                    feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
+-                )
+-            else:
+-                pose_feat_i = None
+-                pose_pos_i = None
+-            new_state_feat, dec = self._recurrent_rollout(
+-                state_feat,
+-                state_pos,
+-                feat_i,
+-                pos_i,
+-                pose_feat_i,
+-                pose_pos_i,
+-                init_state_feat,
+-                img_mask=views[i]["img_mask"],
+-                reset_mask=views[i]["reset"],
+-                update=views[i].get("update", None),
+-            )
+-            out_pose_feat_i = dec[-1][:, 0:1]
+-            new_mem = self.pose_retriever.update_mem(
+-                mem, global_img_feat_i, out_pose_feat_i
++
++        stepper = None
++        if _AO_OPT_1 and self.pose_head_flag and feat[0].is_cuda and len(views) > 1:
++            if getattr(self, "_ao_steps", None) is None:
++                self._ao_steps = _AoStepOpt(self)
++            stepper = self._ao_steps
++            step_key = (
++                tuple(feat[0].shape),
++                tuple(pos[0].shape),
++                tuple(int(v) for v in shape[0][0].cpu().tolist()),
+             )
+-            assert len(dec) == self.dec_depth + 1
+-            head_input = [
+-                dec[0].float(),
+-                dec[self.dec_depth * 2 // 4][:, 1:].float(),
+-                dec[self.dec_depth * 3 // 4][:, 1:].float(),
+-                dec[self.dec_depth].float(),
+-            ]
+-            res = self._downstream_head(head_input, shape[i], pos=pos_i)
+-            ress.append(res)
++
++        for i in range(len(views)):
+             img_mask = views[i]["img_mask"]
+             update = views[i].get("update", None)
+-            if update is not None:
+-                update_mask = (
+-                    img_mask & update
+-                )  # if don't update, then whatever img_mask
++            reset = views[i]["reset"]
++            if stepper is not None and i > 0:
++                res, state_feat, mem = stepper(
++                    step_key,
++                    shape[i],
++                    (feat[i], pos[i], state_feat, state_pos, mem,
++                     init_state_feat, init_mem, img_mask, update, reset),
++                )
+             else:
+-                update_mask = img_mask
+-            update_mask = update_mask[:, None, None].float()
+-            state_feat = new_state_feat * update_mask + state_feat * (
+-                1 - update_mask
+-            )  # update global state
+-            mem = new_mem * update_mask + mem * (
+-                1 - update_mask
+-            )  # then update local state
+-            reset_mask = views[i]["reset"]
+-            if reset_mask is not None:
+-                reset_mask = reset_mask[:, None, None].float()
+-                state_feat = init_state_feat * reset_mask + state_feat * (
+-                    1 - reset_mask
++                feat_i = feat[i]
++                pos_i = pos[i]
++                if self.pose_head_flag:
++                    global_img_feat_i = self._get_img_level_feat(feat_i)
++                    if i == 0:
++                        pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
++                    else:
++                        pose_feat_i = self.pose_retriever.inquire(
++                            global_img_feat_i, mem
++                        )
++                    pose_pos_i = -torch.ones(
++                        feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
++                    )
++                else:
++                    pose_feat_i = None
++                    pose_pos_i = None
++                new_state_feat, dec = self._recurrent_rollout(
++                    state_feat,
++                    state_pos,
++                    feat_i,
++                    pos_i,
++                    pose_feat_i,
++                    pose_pos_i,
++                    init_state_feat,
++                    img_mask=img_mask,
++                    reset_mask=reset,
++                    update=update,
+                 )
+-                mem = init_mem * reset_mask + mem * (1 - reset_mask)
++                out_pose_feat_i = dec[-1][:, 0:1]
++                new_mem = self.pose_retriever.update_mem(
++                    mem, global_img_feat_i, out_pose_feat_i
++                )
++                assert len(dec) == self.dec_depth + 1
++                head_input = [
++                    dec[0].float(),
++                    dec[self.dec_depth * 2 // 4][:, 1:].float(),
++                    dec[self.dec_depth * 3 // 4][:, 1:].float(),
++                    dec[self.dec_depth].float(),
++                ]
++                res = self._downstream_head(head_input, shape[i], pos=pos_i)
++                if update is not None:
++                    update_mask = img_mask & update
++                else:
++                    update_mask = img_mask
++                update_mask = update_mask[:, None, None].float()
++                state_feat = new_state_feat * update_mask + state_feat * (
++                    1 - update_mask
++                )  # update global state
++                mem = new_mem * update_mask + mem * (1 - update_mask)
++                if reset is not None:
++                    reset_mask = reset[:, None, None].float()
++                    state_feat = init_state_feat * reset_mask + state_feat * (
++                        1 - reset_mask
++                    )
++                    mem = init_mem * reset_mask + mem * (1 - reset_mask)
++            ress.append(res)
+             all_state_args.append(
+                 (state_feat, state_pos, init_state_feat, mem, init_mem)
+             )
+diff --git a/src/dust3r/utils/image.py b/src/dust3r/utils/image.py
+index 8eb0f88778f290317d2c08555573d0bf675df25c..47494b9517355b050ac799729607462c74b8588c 100755
+--- a/src/dust3r/utils/image.py
++++ b/src/dust3r/utils/image.py
+@@ -10,6 +10,9 @@ import numpy as np
+ import PIL.Image
+ from PIL.ImageOps import exif_transpose
+ import torchvision.transforms as tvf
++from concurrent.futures import ThreadPoolExecutor
++
++_AO_OPT_4 = int(os.environ.get("CUT3R_OPT_4", "16"))
+ 
+ os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+ import cv2  # noqa
+@@ -92,17 +95,15 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True):
+         supported_images_extensions += [".heic", ".heif"]
+     supported_images_extensions = tuple(supported_images_extensions)
+ 
+-    imgs = []
+-    for path in folder_content:
+-        if not path.lower().endswith(supported_images_extensions):
+-            continue
++    paths = [p for p in folder_content
++             if p.lower().endswith(supported_images_extensions)]
++
++    def _load_one(path):
+         img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert("RGB")
+         W1, H1 = img.size
+         if size == 224:
+-
+             img = _resize_pil_image(img, round(size * max(W1 / H1, H1 / W1)))
+         else:
+-
+             img = _resize_pil_image(img, size)
+         W, H = img.size
+         cx, cy = W // 2, H // 2
+@@ -114,19 +115,22 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True):
+             if not (square_ok) and W == H:
+                 halfh = 3 * halfw / 4
+             img = img.crop((cx - halfw, cy - halfh, cx + halfw, cy + halfh))
++        return (path, W1, H1) + img.size + (
++            dict(img=ImgNorm(img)[None], true_shape=np.int32([img.size[::-1]])),)
+ 
+-        W2, H2 = img.size
++    if _AO_OPT_4 > 1 and len(paths) > 1:
++        with ThreadPoolExecutor(max_workers=_AO_OPT_4) as pool:
++            loaded = list(pool.map(_load_one, paths))
++    else:
++        loaded = [_load_one(p) for p in paths]
++
++    imgs = []
++    for path, W1, H1, W2, H2, entry in loaded:
+         if verbose:
+             print(f" - adding {path} with resolution {W1}x{H1} --> {W2}x{H2}")
+-        imgs.append(
+-            dict(
+-                img=ImgNorm(img)[None],
+-                true_shape=np.int32([img.size[::-1]]),
+-                idx=len(imgs),
+-                instance=str(len(imgs)),
+-            )
+-        )
+-
++        entry["idx"] = len(imgs)
++        entry["instance"] = str(len(imgs))
++        imgs.append(entry)
+     assert imgs, "no images foud at " + root
+     if verbose:
+         print(f" (Found {len(imgs)} images)")
+diff --git a/src/dust3r/utils/misc.py b/src/dust3r/utils/misc.py
+index fbb3f225ba3b0a007541eb81362cd58e1c54d916..7db2343bdebafc716f01d0f666321ed6cdc302f1 100755
+--- a/src/dust3r/utils/misc.py
++++ b/src/dust3r/utils/misc.py
+@@ -58,10 +58,16 @@ def transpose_to_landscape(head, activate=True):
+     and stack everything back together.
+     """
+ 
++    cache = {"ptr": None, "hw": None, "ref": None}
++
+     def wrapper_no(decout, true_shape, **kwargs):
+         B = len(true_shape)
+-        assert true_shape[0:1].allclose(true_shape), "true_shape must be all identical"
+-        H, W = true_shape[0].cpu().tolist()
++        ptr = true_shape.untyped_storage().data_ptr()
++        if cache["hw"] is None or ptr != cache["ptr"]:
++            assert true_shape[0:1].allclose(true_shape), "true_shape must be all identical"
++            cache["hw"] = tuple(int(v) for v in true_shape[0].cpu().tolist())
++            cache["ptr"], cache["ref"] = ptr, true_shape
++        H, W = cache["hw"]
+         res = head(decout, (H, W), **kwargs)
+         return res
+ 
